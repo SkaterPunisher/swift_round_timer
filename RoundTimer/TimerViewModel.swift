@@ -22,31 +22,61 @@ class TimerViewModel: ObservableObject {
     private var timer: Timer?
     private var audioPlayer: AVAudioPlayer?
     
+    // Date-based timer properties
+    private var phaseStartTime: Date?
+    private var currentPhaseDuration: Int = 0
+    private var pausedTimeRemaining: Int = 0
+    private var backgroundTime: Date?
+    
     init() {
         setupAudio()
+        setupNotifications()
         reset()
     }
     
     private func setupAudio() {
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             print("Ошибка настройки аудио: \(error)")
         }
     }
     
+    private func setupNotifications() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            self.handleAppWillResignActive()
+        }
+        
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            self.handleAppDidBecomeActive()
+        }
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+    
     func startTimer() {
         if timerState == .stopped {
             timerState = .work
             currentTime = workTime
+            currentPhaseDuration = workTime
         }
         
         isRunning = true
+        phaseStartTime = Date()
+        pausedTimeRemaining = 0
         
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            self.updateTimer()
-        }
+        startUITimer()
     }
     
     func pauseTimer() {
@@ -54,21 +84,38 @@ class TimerViewModel: ObservableObject {
         timer?.invalidate()
         timer = nil
         timerState = .paused
+        
+        // Сохраняем оставшееся время
+        if let startTime = phaseStartTime {
+            let elapsed = Int(Date().timeIntervalSince(startTime))
+            pausedTimeRemaining = max(0, currentPhaseDuration - elapsed)
+        } else {
+            pausedTimeRemaining = currentTime
+        }
+        
+        phaseStartTime = nil
     }
     
     func resumeTimer() {
         isRunning = true
-        timerState = currentTime == workTime ? .work : .rest
+        timerState = pausedTimeRemaining <= (timerState == .work ? workTime : restTime) / 2 ? 
+                    (currentTime == workTime ? .work : .rest) : 
+                    (pausedTimeRemaining > restTime ? .work : .rest)
         
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            self.updateTimer()
-        }
+        // Устанавливаем новое время начала с учетом паузы
+        phaseStartTime = Date()
+        currentPhaseDuration = pausedTimeRemaining
+        currentTime = pausedTimeRemaining
+        
+        startUITimer()
     }
     
     func stopTimer() {
         isRunning = false
         timer?.invalidate()
         timer = nil
+        phaseStartTime = nil
+        pausedTimeRemaining = 0
         reset()
     }
     
@@ -77,12 +124,25 @@ class TimerViewModel: ObservableObject {
         currentRound = 1
         currentTime = workTime
         isRunning = false
+        phaseStartTime = nil
+        pausedTimeRemaining = 0
+    }
+    
+    private func startUITimer() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            self.updateTimer()
+        }
     }
     
     private func updateTimer() {
-        if currentTime > 0 {
-            currentTime -= 1
-        } else {
+        guard let startTime = phaseStartTime else { return }
+        
+        let elapsed = Int(Date().timeIntervalSince(startTime))
+        let timeRemaining = max(0, currentPhaseDuration - elapsed)
+        
+        currentTime = timeRemaining
+        
+        if timeRemaining <= 0 {
             switchPhase()
         }
     }
@@ -93,12 +153,16 @@ class TimerViewModel: ObservableObject {
         switch timerState {
         case .work:
             timerState = .rest
+            currentPhaseDuration = restTime
             currentTime = restTime
+            phaseStartTime = Date()
         case .rest:
             if currentRound < totalRounds {
                 currentRound += 1
                 timerState = .work
+                currentPhaseDuration = workTime
                 currentTime = workTime
+                phaseStartTime = Date()
             } else {
                 // Тренировка завершена
                 stopTimer()
@@ -106,6 +170,81 @@ class TimerViewModel: ObservableObject {
             }
         default:
             break
+        }
+    }
+    
+    private func handleAppWillResignActive() {
+        backgroundTime = Date()
+    }
+    
+    private func handleAppDidBecomeActive() {
+        guard isRunning, let backgroundStart = backgroundTime, let phaseStart = phaseStartTime else {
+            backgroundTime = nil
+            return
+        }
+        
+        // Проверяем, не закончилась ли текущая фаза или даже вся тренировка
+        let totalElapsed = Int(Date().timeIntervalSince(phaseStart))
+        
+        if totalElapsed >= currentPhaseDuration {
+            // Фаза закончилась в фоне, нужно пересчитать
+            handleMissedPhases(totalElapsed: totalElapsed)
+        }
+        
+        backgroundTime = nil
+    }
+    
+    private func handleMissedPhases(totalElapsed: Int) {
+        var remainingElapsed = totalElapsed - currentPhaseDuration
+        
+        // Переключаемся в следующую фазу
+        playSound()
+        
+        while remainingElapsed > 0 && currentRound <= totalRounds {
+            switch timerState {
+            case .work:
+                timerState = .rest
+                currentPhaseDuration = restTime
+                if remainingElapsed >= restTime {
+                    remainingElapsed -= restTime
+                    playSound()
+                    if currentRound < totalRounds {
+                        currentRound += 1
+                        timerState = .work
+                        currentPhaseDuration = workTime
+                    } else {
+                        stopTimer()
+                        playCompletionSound()
+                        return
+                    }
+                } else {
+                    currentTime = restTime - remainingElapsed
+                    phaseStartTime = Date().addingTimeInterval(-Double(remainingElapsed))
+                    return
+                }
+            case .rest:
+                if currentRound < totalRounds {
+                    currentRound += 1
+                    timerState = .work
+                    currentPhaseDuration = workTime
+                    if remainingElapsed >= workTime {
+                        remainingElapsed -= workTime
+                        playSound()
+                        timerState = .rest
+                        currentPhaseDuration = restTime
+                    } else {
+                        currentTime = workTime - remainingElapsed
+                        phaseStartTime = Date().addingTimeInterval(-Double(remainingElapsed))
+                        return
+                    }
+                } else {
+                    stopTimer()
+                    playCompletionSound()
+                    return
+                }
+            default:
+                break
+            }
         }
     }
     

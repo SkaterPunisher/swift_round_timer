@@ -62,7 +62,7 @@ struct ContentView: View {
                                 Spacer()
                                 HStack {
                                     Button("-") {
-                                        if timerViewModel.workTime > 60 {
+                                        if timerViewModel.workTime > 30 {
                                             timerViewModel.workTime -= 30
                                         }
                                     }
