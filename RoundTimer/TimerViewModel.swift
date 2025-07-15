@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import AudioToolbox
 import UIKit
+import UserNotifications
 
 enum TimerState {
     case stopped
@@ -32,6 +33,7 @@ class TimerViewModel: ObservableObject {
     init() {
         setupAudio()
         setupNotifications()
+        requestNotificationPermissions()
         reset()
     }
     
@@ -64,6 +66,94 @@ class TimerViewModel: ObservableObject {
     
     deinit {
         NotificationCenter.default.removeObserver(self)
+        cancelAllNotifications()
+    }
+    
+    private func requestNotificationPermissions() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if granted {
+                print("Notification permissions granted")
+            } else {
+                print("Notification permissions denied")
+            }
+        }
+    }
+    
+    private func cancelAllNotifications() {
+        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+    }
+    
+    private func schedulePhaseChangeNotifications() {
+        guard isRunning, let startTime = phaseStartTime else { return }
+        
+        // Отменяем все существующие уведомления
+        cancelAllNotifications()
+        
+        var notifications: [(Date, String, String)] = []
+        var currentPhaseEnd = startTime.addingTimeInterval(Double(currentPhaseDuration))
+        var currentRoundNum = currentRound
+        var isWorkPhase = (timerState == .work)
+        
+        // Планируем уведомления для всех оставшихся фаз
+        while currentRoundNum <= totalRounds {
+            if isWorkPhase {
+                // Конец работы - переход к отдыху
+                notifications.append((
+                    currentPhaseEnd,
+                    "Время отдыха!",
+                    "Раунд \(currentRoundNum) завершен. Начинается отдых."
+                ))
+                currentPhaseEnd = currentPhaseEnd.addingTimeInterval(Double(restTime))
+                isWorkPhase = false
+            } else {
+                // Конец отдыха
+                if currentRoundNum < totalRounds {
+                    // Переход к следующему раунду
+                    currentRoundNum += 1
+                    notifications.append((
+                        currentPhaseEnd,
+                        "Раунд \(currentRoundNum)!",
+                        "Отдых окончен. Начинается раунд \(currentRoundNum)."
+                    ))
+                    currentPhaseEnd = currentPhaseEnd.addingTimeInterval(Double(workTime))
+                    isWorkPhase = true
+                } else {
+                    // Конец тренировки
+                    notifications.append((
+                        currentPhaseEnd,
+                        "Тренировка завершена! 🎉",
+                        "Поздравляем! Все \(totalRounds) раундов выполнены."
+                    ))
+                    break
+                }
+            }
+        }
+        
+        // Создаем уведомления
+        for (index, (date, title, body)) in notifications.enumerated() {
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .defaultCritical // Громкий звук для фона
+            content.badge = 1
+            
+            let trigger = UNCalendarNotificationTrigger(
+                dateMatching: Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date),
+                repeats: false
+            )
+            
+            let request = UNNotificationRequest(
+                identifier: "timer-phase-\(index)",
+                content: content,
+                trigger: trigger
+            )
+            
+            UNUserNotificationCenter.current().add(request) { error in
+                if let error = error {
+                    print("Error scheduling notification: \(error)")
+                }
+            }
+        }
     }
     
     func startTimer() {
@@ -78,6 +168,7 @@ class TimerViewModel: ObservableObject {
         pausedTimeRemaining = 0
         
         startUITimer()
+        schedulePhaseChangeNotifications()
     }
     
     func pauseTimer() {
@@ -85,6 +176,9 @@ class TimerViewModel: ObservableObject {
         timer?.invalidate()
         timer = nil
         timerState = .paused
+        
+        // Отменяем уведомления при паузе
+        cancelAllNotifications()
         
         // Сохраняем оставшееся время
         if let startTime = phaseStartTime {
@@ -109,6 +203,7 @@ class TimerViewModel: ObservableObject {
         currentTime = pausedTimeRemaining
         
         startUITimer()
+        schedulePhaseChangeNotifications()
     }
     
     func stopTimer() {
@@ -117,6 +212,10 @@ class TimerViewModel: ObservableObject {
         timer = nil
         phaseStartTime = nil
         pausedTimeRemaining = 0
+        
+        // Отменяем все уведомления при остановке
+        cancelAllNotifications()
+        
         reset()
     }
     
@@ -184,12 +283,20 @@ class TimerViewModel: ObservableObject {
             return
         }
         
+        // Отменяем старые уведомления при возврате
+        cancelAllNotifications()
+        
         // Проверяем, не закончилась ли текущая фаза или даже вся тренировка
         let totalElapsed = Int(Date().timeIntervalSince(phaseStart))
         
         if totalElapsed >= currentPhaseDuration {
             // Фаза закончилась в фоне, нужно пересчитать
             handleMissedPhases(totalElapsed: totalElapsed)
+        }
+        
+        // Перепланируем уведомления для оставшегося времени
+        if isRunning {
+            schedulePhaseChangeNotifications()
         }
         
         backgroundTime = nil
